@@ -160,13 +160,13 @@ class DSSTtracker:
                 caux = cv2.mulSpectrums(fftd(x1aux), fftd(x2aux), 0, conjB=True)
                 # 本质上是卷积之后x1和x2在fft之后卷积，conjB表示对第二个输入进行共轭
                 ##########?????????????问题：公式31交换共轭的位置会不会影响计算结果。原则上输入x1和x2在地位上是等价的，但是为什么公式上采用第一个共轭呢，实际有没有影响
-                caux = real(fftd(caux, True))  # backwards=True。傅里叶逆变换，并选取实部
+                caux = Real(fftd(caux, True))  # backwards=True。傅里叶逆变换，并选取实部
                 c += caux  # 各个通道计算结果相加
             c = rearrange(c)  # rearrange是自定义的函数，用于将FFT输出中的直流分量移动到频谱的中央。
         else:
             c = cv2.mulSpectrums(fftd(x1), fftd(x2), 0, conjB=True)
             c = fftd(c, True)
-            c = real(c)
+            c = Real(c)
             c = rearrange(c)
 
         # 加上 x1和x2的范数
@@ -293,7 +293,7 @@ class DSSTtracker:
     def detect(self, z, x):  # z是已知的结果，x是当前输入
         k = self.GaussianCorrelation(z, x)
         # 获取响应图
-        res = real(fftd(complexMultiplication(self._alphaf, fftd(k)), True))  # 频域相乘之后傅里叶逆变换
+        res = Real(fftd(complexMultiplication(self._alphaf, fftd(k)), True))  # 频域相乘之后傅里叶逆变换
 
         # pv:响应最大值 pi:最大响应点的位置
         _, pv, _, pi = cv2.minMaxLoc(res)
@@ -347,14 +347,14 @@ class DSSTtracker:
             if self._roi[1] >= image.shape[0] - 1: self._roi[1] = image.shape[0] - 1  ##相比开始调整了些数值
 
             # 更新尺度
-            scale_pi = self.detect_scale()  # 检测当前图像尺度
+            scale_pi = self.detect_scale(image)  # 检测当前输入帧的图像尺度
             self.currentScaleFactor = self.currentScaleFactor * self.scaleFactors[scale_pi[0]]
             # scaleFactors所有尺度的变化速率，从大到小，1是中间数
             if self.currentScaleFactor < self.min_scale_factor:
                 self.currentScaleFactor = self.min_scale_factor
             # 到这里为止仅仅是尺度系数currentScaleFactor发生了变化, roi还没有变化
 
-            self.train_scale(image)  # 训练尺度估计器..???这个会不会改变_roi
+            self.train_scale(image)  # 训练尺度估计器.最后会update_roi，进而改变roi
 
         # 修正边界。观察roi的定位坐标(x,y)有没有超出边界. 目标roi的框应当与图片有重合部分，是不是全部在原图内没有关系
         if self._roi[0] + self._roi[2] <= 0: self._roi[0] = -self._roi[2] + 2
@@ -417,8 +417,8 @@ class DSSTtracker:
         # 获取尺度速率(scaling rate) 来压缩模型尺寸??
         scale_model_factor = 1.  # 这是一个类似_scale的参数，表征将图片压缩的比例。
         if self.base_height * self.base_width > self.scale_max_area:
-            scale_model_factor = (
-                                         self.scale_max_area / self.base_height * self.base_width) ** 0.5  # 面积之比的开方，表征单个维度的缩小比例
+            scale_model_factor = (self.scale_max_area / self.base_height * self.base_width) ** 0.5
+            # 面积之比的开方，表征单个维度的缩小比例
 
         self.scale_model_height = int(self.base_height * scale_model_factor)
         self.scale_model_width = int(self.base_width * scale_model_factor)
@@ -447,12 +447,13 @@ class DSSTtracker:
             cx = self._roi[0] + self._roi[2] / 2
             cy = self._roi[1] + self._roi[3] / 2
 
-            # 获得subwindow
-            im_patch = extractImage(image, cx, cy, patch_width, patch_height)  # im_patch是提取的区域。extractImage是类似subwindow
-            if self.scale_model_width > im_patch.shape[1]:  # 如果scale_model_width大于截取图片的尺寸
+            # 获得subwindow，扣取图片
+            im_patch = extractImage(image, cx, cy, patch_width, patch_height)  # im_patch是提取的区域。extractImage是类似subwindow, 但是subwindows是在频域的
+            if self.scale_model_width > im_patch.shape[1]:  # 如果scale_model_width大于截取图片的尺寸。scale_model_width表示将图片保持在template以内尺寸。
+                # 如果im_patch小于scale_model_width，说明要放大，上采样
                 im_patch_resized = cv2.resize(im_patch, (self.scale_model_width, self.scale_model_height), None, 0, 0,
                                               1)  # 最后的插值方式不同
-            else:
+            else:#下采样
                 im_patch_resized = cv2.resize(im_patch, (self.scale_model_width, self.scale_model_height), None, 0, 0,
                                               3)
 
@@ -477,46 +478,65 @@ class DSSTtracker:
 
     # 训练尺度估计器
     def train_scale(self, image, init=False):
-        xsf = self.get_scale_sample(image) #获取n_scales个特征featuresMap。xsf(totalsize,n_scales)
+        xsf = self.get_scale_sample(image)  # 获取n_scales个特征featuresMap。xsf(totalsize,n_scales)
 
         # Adjust ysf to the same size as xsf in the first time
         # 在第一帧的时候调整ysf到xsf相同的形状。ysf的尺寸是array [-xx~xx] 尺寸是1*n_scales
         if init:
             totalSize = xsf.shape[0]
-            self.ysf = cv2.repeat(self.ysf, totalSize, 1) #ysf在第一个维度重复totalSize次. 在自己的维度就是自己。(1代表重复次数)
+            self.ysf = cv2.repeat(self.ysf, totalSize, 1)  # ysf在第一个维度重复totalSize次. 在自己的维度就是自己。(1代表重复次数)
 
         # Get new GF in the paper (delta A)
+        # num指的是numerator--分子，DSST论文中的At
         new_sf_num = cv2.mulSpectrums(self.ysf, xsf, 0, conjB=True)
 
+        #den指得是denominator--分母，DSST论文中的Bt
         new_sf_den = cv2.mulSpectrums(xsf, xsf, 0, conjB=True)
-        new_sf_den = cv2.reduce(real(new_sf_den), 0, cv2.REDUCE_SUM)
+        new_sf_den = cv2.reduce(Real(new_sf_den), 0, cv2.REDUCE_SUM)  # 0表示数据被处理成一行(1,n_scales).输出结果是每一列之和
 
+        #更新分子分母
         if init:
             self.sf_den = new_sf_den
             self.sf_num = new_sf_num
         else:
             # Get new A and new B
             self.sf_den = cv2.addWeighted(self.sf_den, (1 - self.scale_lr), new_sf_den, self.scale_lr, 0)
+            # 历史参数和现在计算结果加权。
+            # self.sf_den = self.sf_den*(1 - self.scale_lr)+new_sf_den*self.scale_lr
             self.sf_num = cv2.addWeighted(self.sf_num, (1 - self.scale_lr), new_sf_num, self.scale_lr, 0)
 
         self.update_roi()
 
+    def update_roi(self):
+        cx=self._roi[0] +self._roi[2]/2
+        cy=self._roi[1]+self._roi[3]/2
+
+        #重新计算框的长宽
+        self._roi[2]=self.base_width*self.currentScaleFactor
+        self._roi[3]=self.base_height*self.currentScaleFactor
+
+        self._roi[0]=cx-self._roi[2]/2.0
+        self._roi[1]=cy-self._roi[3]/2.0
+
+
+
     # 检测当前图像尺度
     def detect_scale(self, image):
-        # xsf = self.get_scale_sample(image)
-        #
-        # # Compute AZ in the paper
-        # add_temp = cv2.reduce(complexMultiplication(self.sf_num, xsf), 0, cv2.REDUCE_SUM)
-        #
-        # # compute the final y
-        # scale_response = cv2.idft(complexDivisionReal(add_temp, (self.sf_den + self.scale_lambda)), None,
-        #                           cv2.DFT_REAL_OUTPUT)
-        #
-        # # Get the max point as the final scaling rate
-        # # pv:响应最大值 pi:相应最大点的索引数组
-        # _, pv, _, pi = cv2.minMaxLoc(scale_response)
+        xsf = self.get_scale_sample(image) #xsf尺寸(totalSize, self.n_scales)
 
-        return pi
+        # Compute AZ in the paper
+        add_temp = cv2.reduce(complexMultiplication(self.sf_num, xsf), 0, cv2.REDUCE_SUM) #DSST论文公式6
+
+        # compute the final y
+        #complexDivisionReal 是虚数除以实数
+        scale_response = cv2.idft(complexDivisionReal(add_temp, (self.sf_den + self.scale_lambda)), None,
+                                  cv2.DFT_REAL_OUTPUT) #cv2.idft是傅里叶反变换
+
+        # Get the max point as the final scaling rate
+        # pv:响应最大值 pi:相应最大点的索引数组
+        _, pv, _, pi = cv2.minMaxLoc(scale_response)
+
+        return pi #返回最大的位置
 
 
 if __name__ == "__main__":
@@ -544,8 +564,5 @@ if __name__ == "__main__":
     #     pass
 
     aa, bb = np.ogrid[0:10, 0:10]
-    yy=cv2.repeat(bb,10,2)
+    yy = cv2.repeat(bb, 10, 2)
     print(yy)
-
-
-
