@@ -106,19 +106,24 @@ def limitBorder(rect, limits):
 
 
 # 取超出来的边界
-#??感觉就像是original包裹住了limited
+# ??感觉就像是original包裹住了limited
 def getBorder(original, limited):
     res = [0., 0., 0., 0.]
     res[0] = limited[0] - original[0]
     res[1] = limited[1] - original[1]
     res[2] = rightBorder(original) - rightBorder(limited)
     res[3] = bottomBorder(original) - bottomBorder(limited)
-    assert (np.all(np.array(res) >= 0))
+    assert (np.all(np.array(res) >= 0))  # 以上计算结果必须大于0
     return res
 
 
-# 裁剪搜索区域
-def subWindow():
+# 空间域和频域滤波处理之前需要考率图像的边界情况
+# 处理方法是为图像增加一定的边缘，适应卷积核在原图像边缘的操作
+# 用例： subWindow(image, extracted_roi, cv2.BORDER_REPLICATE)
+def subWindow(image, window, borderType=cv2.BORDER_CONSTANT):
+    cutWindow=[x for x in window] #类似深拷贝。window= (x,y,w,h)
+    cutWindow=limitBorder(cutWindow,[0,0,image.shape[1],image.shape[0]])
+    assert (cutWindow[2]>0 and cutWindow[3]>0)
     return
 
 
