@@ -17,6 +17,8 @@ import os
 import numpy as np
 
 import cv2
+from utils import *
+import fhog
 
 
 class DSSTtracker:
@@ -29,7 +31,7 @@ class DSSTtracker:
         if self.multi_scale:
             self.template_size = 96  # 模板大小，在计算_tmpl_sz时，较大边长被归一成96，而较小边长按比例缩小
             self.scale_padding = 1.0
-            self.scale_step = 1.02  # scale_factor. 抽取目标周围a^nPXa^nR系列尺度的大小
+            self.scale_step = 1.05  # scale_factor. 抽取目标周围a^nPXa^nR系列尺度的大小
             self.scale_sigma_factor = 0.25  # 这个是不是和高斯带宽有关??
             self.n_scales = 33  # 尺度的数量。33个尺度数量能否采用数值近似的方法进行描述??用函数描述是否在大尺度变化的视频上面表现更优异
 
@@ -37,7 +39,7 @@ class DSSTtracker:
             self.scale_max_area = 512  # 尺度的最大区域。
             self.scale_lambda = 0.01  # 正则系数
 
-            if ~hog:
+            if hog == False:
                 print('HOG feature is forced to turn on.')
         elif fixed_windows:  # 不采用多尺度
             self.template_size = 96
@@ -63,7 +65,7 @@ class DSSTtracker:
 
         self._tmpl_sz = [0, 0]  # 滤波模板大小
         self._roi = [0., 0., 0., 0.]  # (x,y,w,h)
-        self.size_patch = [0, 0, 0]  # (w,h,c)  //size_patch用于保存截取下来的ROI区域的h，w，c用处：汉宁窗。
+        self.size_patch = [0., 0., 0.]  # (w,h,c)  //size_patch用于保存截取下来的ROI区域的h，w，c用处：汉宁窗。
         self._scale = 1  # 将最大的边缩小到96，_scale是缩小比例
 
         self._alphaf = None  # (size_patch[0], size_patch[1], 2) _alphaf是频域中的相关滤波模板，有两个通道分别实部虚部
@@ -120,7 +122,7 @@ class DSSTtracker:
                          0:self.size_patch[1]]  # hann2t是纵向一维数组，hann1t是横向一维数组.数值递增，大小分别是从0~size_patch
         hann1t = 0.5 * (
                 1 - np.cos(2 * np.pi * hann1t / (self.size_patch[1] - 1)))  # (1-cos)在[0,2pi]的范围内形状类似正态分布函数，两端低中间高
-        hann2t = 0.5 * (1 - np.cos(2 * np.pi * hann2t / (self.size_patch[1] - 1)))
+        hann2t = 0.5 * (1 - np.cos(2 * np.pi * hann2t / (self.size_patch[0] - 1)))
         hann2d = hann2t * hann1t
 
         if self.hogFeature:
@@ -136,8 +138,7 @@ class DSSTtracker:
     # 高斯函数
     # 仅在第一帧使用，产生高斯响应
     def CreateGaussianPeak(self, sizey, sizex):
-        assert (type(sizex) == 'float' and type(sizey) == 'float')
-        cy, cx = sizey / 2, sizex / 2
+        cy, cx = sizey / 2.0, sizex / 2.0
         output_sigma = np.sqrt(sizex * sizey) / self.pad * self.output_sigma_factor  # ?????
 
         # 因为系数对于任何位置而言都是 1/sqrt(2pi*sigma*sigma)，故在此忽略
@@ -162,19 +163,20 @@ class DSSTtracker:
                 ##########?????????????问题：公式31交换共轭的位置会不会影响计算结果。原则上输入x1和x2在地位上是等价的，但是为什么公式上采用第一个共轭呢，实际有没有影响
                 caux = Real(fftd(caux, True))  # backwards=True。傅里叶逆变换，并选取实部
                 c += caux  # 各个通道计算结果相加
-            c = rearrange(c)  # rearrange是自定义的函数，用于将FFT输出中的直流分量移动到频谱的中央。
+            c = rearange(c)  # rearrange是自定义的函数，用于将FFT输出中的直流分量移动到频谱的中央。
         else:
             c = cv2.mulSpectrums(fftd(x1), fftd(x2), 0, conjB=True)
             c = fftd(c, True)
             c = Real(c)
-            c = rearrange(c)
+            c = rearange(c)
 
         # 加上 x1和x2的范数
         if x1.ndim == 3 and x2.ndim == 3:
             d = (np.sum(x1[:, :, 0] * x1[:, :, 0]) + np.sum(x2[:, :, 0] * x2[:, :, 0]) - 2.0 * c) / (
-                    self.size_patch[0] * self.size_patch[1] * self.size_patch[3])  # 公式31 ???不过为什么除以维度总数--回答：模量求值公式
+                    self.size_patch[0] * self.size_patch[1] * self.size_patch[2])  # 公式31 ???不过为什么除以维度总数--回答：模量求值公式
+            # size_patch[2]序号没有3
         elif x1.ndim == 2 and x2.ndim == 2:
-            d = (np.sum(x1 * x1 + x2 * x2) - 2 * c) / (self.size_patch[0] * self.size_patch[1] * self.size_patch[3])
+            d = (np.sum(x1 * x1 + x2 * x2) - 2 * c) / (self.size_patch[0] * self.size_patch[1] * self.size_patch[2])
         d = d * (d >= 0)  # d小于0的时候，d为0
         d = np.exp(-d / (self.sigma * self.sigma))  # 公式31
         return d
@@ -188,11 +190,12 @@ class DSSTtracker:
         # _tmpl是截取的特征的加权
         self._tmpl = self.getFeatures(image, inithann=True)  # 提取特征.True表示初始化hanning窗
         # _prob是初始化时的高斯响应图
-        self._prob = self.CreateGaussianPeak(self.size_patch[0], self.size_patch[1])  # 高斯分布
+        self._prob = self.CreateGaussianPeak(self.size_patch[0],
+                                             self.size_patch[1])  # 高斯分布 !!!注意输入size_patch[0]，size_patch[1]
         # _alphadf是频域中的相关滤波模板，有两个通道分别是实部和虚部
         self._alphaf = np.zeros((self.size_patch[0], self.size_patch[1], 2), np.float32)  #
 
-        if self._multiscale:
+        if self.multi_scale:
             self.DsstInit(self._roi, image)  # 这里是初始化尺度滤波器
 
         self.train(self._tmpl, train_interp_factor=1.0)  # 初始化训练的时候更新的系数为1.0，表明目前输入占参数变换的100%
@@ -241,7 +244,7 @@ class DSSTtracker:
         extracted_roi[3] = int(scale_adjust * self._scale * self._tmpl_sz[1] * self.currentScaleFactor)
 
         extracted_roi[0] = int(cx - extracted_roi[2] / 2)  # 能不能改写成 cx - extracted_roi[2] // 2
-        extracted_roi[1] = int(cx - extracted_roi[3] / 2)
+        extracted_roi[1] = int(cy - extracted_roi[3] / 2)
 
         # z是当前被裁剪下来的搜索区域
         z = subWindow(image, extracted_roi, cv2.BORDER_REPLICATE)  # cv2.BORDER_REPLICATE边界复制
@@ -257,9 +260,10 @@ class DSSTtracker:
             mapp = fhog.PCAFeatureMaps(mapp)
 
             # size_patch用于保存截取下来的特征图的 h，w，c
-            self.size_patch = list(map(int, [mapp['sizeX'], mapp['sizeY'], mapp['numFeatures']]))  # map函数用来进行int操作
-            featuresMap = mapp['mapp'].reshape((self.size_patch[0] * self.size_patch[1],
-                                                self.size_patch[2])).T  ## (size_patch[2], size_patch[0]*size_patch[1])
+            self.size_patch = list(map(int, [mapp['sizeY'], mapp['sizeX'], mapp[
+                'numFeatures']]))  # map函数用来进行int操作 !!!这里的顺序mapp['sizeY'], mapp['sizeX']
+            featuresMap = mapp['map'].reshape((self.size_patch[0] * self.size_patch[1],
+                                               self.size_patch[2])).T  ## (size_patch[2], size_patch[0]*size_patch[1])
 
         else:  # 不采用HOG特征，就将图片转化为单通道图片
             if z.ndim == 3 and z.shape[2] == 3:
@@ -291,7 +295,7 @@ class DSSTtracker:
     # 检测当前帧的目标
     # z是前一帧的训练/第一帧的初始化结果，x是当前帧当前尺度下的特征，peak_value是检测结果峰值
     def detect(self, z, x):  # z是已知的结果，x是当前输入
-        k = self.GaussianCorrelation(z, x)
+        k = self.GaussianCorrelation(x, z)
         # 获取响应图
         res = Real(fftd(complexMultiplication(self._alphaf, fftd(k)), True))  # 频域相乘之后傅里叶逆变换
 
@@ -310,8 +314,8 @@ class DSSTtracker:
             p[1] += self.SubPixelPeak(left, pv, right)
 
         # 再结合res的尺寸，可以得到roi坐标(x,y,w,h)
-        p[0] -= res.shape[1] / 2  # x--w.img.shape返回的是h和w，第一个维度是h，第二个维度才是w
-        p[1] -= res.shape[0] / 2  # y--h
+        p[0] -= res.shape[1] / 2.0  # x--w.img.shape返回的是h和w，第一个维度是h，第二个维度才是w
+        p[1] -= res.shape[0] / 2.0  # y--h
 
         # 返回定位坐标和峰值
         return p, pv
@@ -326,7 +330,8 @@ class DSSTtracker:
 
         # 尺度不发生变化的时候，检测峰值及其位置
         # self._tmpl是上一个时刻的计算结果
-        loc, peak_value = self.detect(self._tmpl, self.getFeatures(image=image))
+        loc, peak_value = self.detect(self._tmpl,
+                                      self.getFeatures(image=image, inithann=0, scale_adjust=1.0))  # !!!这里汉宁窗的初始化需要设置为0
         # self._tmpl在hog的条件下是特征表达，在~hog的时候是灰度图像输入
 
         # 原来跟踪框的中心
@@ -370,7 +375,7 @@ class DSSTtracker:
         self.train(x, self.interp_factor)  # self.interp_factor表示参数更新时启用上一次的历史参数值
         # train应该不改动roi的尺寸
 
-        return sefl._roi  # (x,y,w,h)
+        return self._roi  # (x,y,w,h)
 
     #################
     ### 尺度估计器 ###
@@ -417,7 +422,7 @@ class DSSTtracker:
         # 获取尺度速率(scaling rate) 来压缩模型尺寸??
         scale_model_factor = 1.  # 这是一个类似_scale的参数，表征将图片压缩的比例。
         if self.base_height * self.base_width > self.scale_max_area:
-            scale_model_factor = (self.scale_max_area / self.base_height * self.base_width) ** 0.5
+            scale_model_factor = (self.scale_max_area / self.base_height / self.base_width) ** 0.5
             # 面积之比的开方，表征单个维度的缩小比例
 
         self.scale_model_height = int(self.base_height * scale_model_factor)
@@ -448,18 +453,20 @@ class DSSTtracker:
             cy = self._roi[1] + self._roi[3] / 2
 
             # 获得subwindow，扣取图片
-            im_patch = extractImage(image, cx, cy, patch_width, patch_height)  # im_patch是提取的区域。extractImage是类似subwindow, 但是subwindows是在频域的
-            if self.scale_model_width > im_patch.shape[1]:  # 如果scale_model_width大于截取图片的尺寸。scale_model_width表示将图片保持在template以内尺寸。
+            im_patch = extractImage(image, cx, cy, patch_width,
+                                    patch_height)  # im_patch是提取的区域。extractImage是类似subwindow, 但是subwindows是在频域的
+            if self.scale_model_width > im_patch.shape[1]:
+                # 如果scale_model_width大于截取图片的尺寸。scale_model_width表示将图片保持在template以内尺寸。
                 # 如果im_patch小于scale_model_width，说明要放大，上采样
                 im_patch_resized = cv2.resize(im_patch, (self.scale_model_width, self.scale_model_height), None, 0, 0,
                                               1)  # 最后的插值方式不同
-            else:#下采样
+            else:  # 下采样
                 im_patch_resized = cv2.resize(im_patch, (self.scale_model_width, self.scale_model_height), None, 0, 0,
                                               3)
 
             # 提取hog特征
-            mapp = {'sizeX': 0, 'sizeY': 0, 'numFeatures': 0,
-                    'map': 0}  # sizeX和sizeY是特征图的宽和高，应该和高斯函数的两个参数对应,numFeatures对应通道数。 ???map是啥
+            mapp = {'sizeX': 0, 'sizeY': 0, 'numFeatures': 0, 'map': 0}
+            # sizeX和sizeY是特征图的宽和高，应该和高斯函数的两个参数对应,numFeatures对应通道数。 ???map是啥
             mapp = fhog.getFeatureMaps(im_patch_resized, self.cell_size, mapp)  # 调用hog(image, k, mapp)提取特征。
             mapp = fhog.normalizeAndTruncate(mapp, 0.2)  # 归一化并且截断
             mapp = fhog.PCAFeatureMaps(mapp)
@@ -474,7 +481,7 @@ class DSSTtracker:
             featuresMap = self.s_hann[0][i] * featuresMap  # （1*totalSize）
             xsf[:, i] = featuresMap[:, 0]  # 这样复制等价于深拷贝(已验证)
 
-        return fftd(xsf, backwards=False, byRow=True)
+        return fftd(xsf, backWards=False, byRow=True)
 
     # 训练尺度估计器
     def train_scale(self, image, init=False):
@@ -490,11 +497,11 @@ class DSSTtracker:
         # num指的是numerator--分子，DSST论文中的At
         new_sf_num = cv2.mulSpectrums(self.ysf, xsf, 0, conjB=True)
 
-        #den指得是denominator--分母，DSST论文中的Bt
+        # den指得是denominator--分母，DSST论文中的Bt
         new_sf_den = cv2.mulSpectrums(xsf, xsf, 0, conjB=True)
         new_sf_den = cv2.reduce(Real(new_sf_den), 0, cv2.REDUCE_SUM)  # 0表示数据被处理成一行(1,n_scales).输出结果是每一列之和
 
-        #更新分子分母
+        # 更新分子分母
         if init:
             self.sf_den = new_sf_den
             self.sf_num = new_sf_num
@@ -508,35 +515,33 @@ class DSSTtracker:
         self.update_roi()
 
     def update_roi(self):
-        cx=self._roi[0] +self._roi[2]/2
-        cy=self._roi[1]+self._roi[3]/2
+        cx = self._roi[0] + self._roi[2] / 2
+        cy = self._roi[1] + self._roi[3] / 2
 
-        #重新计算框的长宽
-        self._roi[2]=self.base_width*self.currentScaleFactor
-        self._roi[3]=self.base_height*self.currentScaleFactor
+        # 重新计算框的长宽
+        self._roi[2] = self.base_width * self.currentScaleFactor
+        self._roi[3] = self.base_height * self.currentScaleFactor
 
-        self._roi[0]=cx-self._roi[2]/2.0
-        self._roi[1]=cy-self._roi[3]/2.0
-
-
+        self._roi[0] = cx - self._roi[2] / 2.0
+        self._roi[1] = cy - self._roi[3] / 2.0
 
     # 检测当前图像尺度
     def detect_scale(self, image):
-        xsf = self.get_scale_sample(image) #xsf尺寸(totalSize, self.n_scales)
+        xsf = self.get_scale_sample(image)  # xsf尺寸(totalSize, self.n_scales)
 
         # Compute AZ in the paper
-        add_temp = cv2.reduce(complexMultiplication(self.sf_num, xsf), 0, cv2.REDUCE_SUM) #DSST论文公式6
+        add_temp = cv2.reduce(complexMultiplication(self.sf_num, xsf), 0, cv2.REDUCE_SUM)  # DSST论文公式6
 
         # compute the final y
-        #complexDivisionReal 是虚数除以实数
+        # complexDivisionReal 是虚数除以实数
         scale_response = cv2.idft(complexDivisionReal(add_temp, (self.sf_den + self.scale_lambda)), None,
-                                  cv2.DFT_REAL_OUTPUT) #cv2.idft是傅里叶反变换
+                                  cv2.DFT_REAL_OUTPUT)  # cv2.idft是傅里叶反变换
 
         # Get the max point as the final scaling rate
         # pv:响应最大值 pi:相应最大点的索引数组
         _, pv, _, pi = cv2.minMaxLoc(scale_response)
 
-        return pi #返回最大的位置
+        return pi  # 返回最大的位置
 
 
 if __name__ == "__main__":
