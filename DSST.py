@@ -33,7 +33,7 @@ class DSSTtracker:
             self.scale_padding = 1.0
             self.scale_step = 1.05  # scale_factor. 抽取目标周围a^nPXa^nR系列尺度的大小
             self.scale_sigma_factor = 0.25  # 这个是不是和高斯带宽有关??
-            self.n_scales = 33  # 尺度的数量。33个尺度数量能否采用数值近似的方法进行描述??用函数描述是否在大尺度变化的视频上面表现更优异
+            self.n_scales = 33  # 尺度的数量。
 
             self.scale_lr = 0.025  # 尺度滤波器学习速率，即论文中的公式（5）
             self.scale_max_area = 512  # 尺度的最大区域。
